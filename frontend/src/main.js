@@ -5,7 +5,8 @@ import {topic} from './constants/project.js';
 import {loginPage} from './pages/login.js';
 import {casesPage} from './pages/cases.js';
 import {bindEditor, editorPage} from './pages/editor.js';
-import {runsPage} from './pages/runs.js';
+import {bindRuns, runsPage} from './pages/runs.js';
+import {bindCorrections, correctionsPage} from './pages/corrections.js';
 import {bindEvidence, evidencePage} from './pages/evidence.js';
 import {go, route} from './router/hash.js';
 import {submit} from './hooks/submit.js';
@@ -21,7 +22,7 @@ function fail(error) {
   if (message) { message.textContent=error.message; message.className='error'; }
 }
 const api = (path, options={})=>request(path, {...options, token:state.session?.token});
-const pages = {cases:casesPage, editor:editorPage, runs:runsPage, evidence:evidencePage};
+const pages = {cases:casesPage, editor:editorPage, runs:runsPage, corrections:correctionsPage, evidence:evidencePage};
 async function refresh() {
   clearTimeout(timer);
   const key = ++revision;
@@ -37,9 +38,13 @@ async function refresh() {
   const {key: page,id} = route();
   if (!pages[page]) { go('cases'); return; }
   try {
-    const result = await Promise.all([state.spec || api('/spec'),api('/cases'),api('/runs'),api('/evidence'),api('/audit')]);
+    const extra = page==='editor' && state.session.role==='operator' ? [api('/delegation-versions/current').catch(()=>null)] : [Promise.resolve(null)];
+    const result = await Promise.all([state.spec || api('/spec'),api('/cases'),api('/runs'),api('/evidence'),api('/audit'),api('/delegation-versions'),api('/corrections'),...extra]);
     if (revision !== key) return;
     [state.spec,state.cases,state.runs,state.evidence,state.audit]=result;
+    state.versions=result[5].versions; state.currentVersionId=result[5].current_version_id;
+    state.currentSnapshot=result[7]?.snapshot || null;
+    state.corrections=result[6];
   } catch (error) {
     if (revision !== key) return;
     if (!document.getElementById('message')) app.innerHTML='<main><div id="message" role="alert"></div><button id="retry">重试</button></main>';
@@ -53,11 +58,9 @@ async function refresh() {
     <div class="workspace"><nav aria-label="业务模块">${navigation}</nav><main><div id="message" role="alert"></div>${pages[page](state,id)}</main></div>`;
   document.getElementById('logout').addEventListener('click',()=>{setSession(null); void refresh();});
   if (page==='editor') bindEditor(state, api, fail);
+  if (page==='corrections') bindCorrections(api, refresh, fail);
   if (page==='evidence') bindEvidence(api, refresh, fail);
-  if (page==='runs') {
-    document.getElementById('refresh').addEventListener('click', refresh);
-    if (state.runs.some(row=>['queued','running'].includes(row.status))) timer=setTimeout(refresh,1000);
-  }
+  if (page==='runs' && bindRuns(state, api, refresh, fail)) timer=setTimeout(refresh,1000);
 }
 window.addEventListener('hashchange', refresh);
 void refresh();

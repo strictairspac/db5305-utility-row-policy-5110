@@ -5,6 +5,7 @@ export const topic = {
     "区域委派",
     "抄表工单",
     "权限验签",
+    "调度更正",
     "差异清单"
   ],
   "algorithm": "构造行级访问矩阵，在 PostgreSQL RLS 中以受限角色核对可见集"

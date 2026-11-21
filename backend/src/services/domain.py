@@ -111,7 +111,7 @@ def _index(records, key):
     return index
 
 
-def _read_payload(payload):
+def _read_payload(payload, snapshot=None):
     if not isinstance(payload, dict):
         raise ValueError("验签输入须为对象。")
     audit_at = _time(payload.get("audit_at"), "验签时点")
@@ -119,8 +119,19 @@ def _read_payload(payload):
     orders = _index(_records(payload, "work_orders", "order_id", "meter_id", "zone", "utility"), "order_id")
     if not operators:
         raise ValueError("至少需要一名待验签人员。")
+    # An explicit snapshot is the pinned delegation version.  Delegations for
+    # people outside this verification are irrelevant, so they are filtered
+    # out before the usual validation.
+    if snapshot is not None:
+        rows = snapshot.get("delegations") if isinstance(snapshot, dict) else snapshot
+        if not isinstance(rows, list):
+            raise ValueError("委派版本快照须为数组。")
+        source = [row for row in rows if isinstance(row, dict) and row.get("operator_id") in operators]
+    else:
+        source = payload.get("delegations")
     delegations = []
-    for row in _records(payload, "delegations", "operator_id", "zone", "utility", "valid_from", "valid_until"):
+    for row in _records({"delegations": source}, "delegations",
+                        "operator_id", "zone", "utility", "valid_from", "valid_until"):
         if row["operator_id"] not in operators:
             raise ValueError(f"区域委派引用了未知人员（{row['operator_id']}）。")
         start = _time(row["valid_from"], "委派生效时间")
@@ -146,8 +157,14 @@ def validate(payload):
     _read_payload(payload)
 
 
-def solve(payload, engine):
-    audit_at, operators, orders, delegations, expected = _read_payload(payload)
+def solve(payload, engine, snapshot=None):
+    """Run one verification.
+
+    ``snapshot`` is the pinned delegation version's row list.  When present it
+    replaces ``payload['delegations']``, so a correction published after the
+    run was queued cannot change what the run evaluates.
+    """
+    audit_at, operators, orders, delegations, expected = _read_payload(payload, snapshot)
     readings = read_visible_orders(engine, audit_at, sorted(operators), orders.values(), delegations)
     order_ids = sorted(orders)
     people, matrix, differences = [], [], []

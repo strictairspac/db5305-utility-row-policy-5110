@@ -3,11 +3,12 @@ import uuid
 
 from fastapi import HTTPException
 from sqlalchemy import and_, or_, select
+from sqlalchemy.exc import IntegrityError
 
 from src.config.settings import cache, engine
 from src.constants.workflow import Status
 from src.models.tables import audit, cases, evidence, runs
-from src.services import domain
+from src.services import corrections, domain
 from src.utils.encoding import canonical
 from src.utils.time import utc_time
 
@@ -28,7 +29,7 @@ def found(conn, table, identity):
     return dict(row)
 
 
-def make_case(title, payload, actor):
+def make_case(title, payload, actor, base_version_id=None):
     title = title.strip()
     if not title:
         raise HTTPException(422, '档案名称不能为空')
@@ -40,25 +41,79 @@ def make_case(title, payload, actor):
     except (ValueError, TypeError) as exc:
         raise HTTPException(422, str(exc)) from None
     with engine.begin() as conn:
-        case_id = conn.execute(cases.insert().values(slug=uuid.uuid4().hex, title=title, payload=payload,
+        slug = uuid.uuid4().hex
+        # Import the delegation export first: a stale or malformed export
+        # aborts the whole transaction, so no half-made case is left behind.
+        if isinstance(payload.get('delegations'), list):
+            try:
+                corrections.import_snapshot(payload['delegations'], actor,
+                                            reference=f'case:{slug}', conn=conn,
+                                            expected_version_id=base_version_id)
+            except ValueError as exc:
+                raise HTTPException(422, str(exc)) from None
+        case_id = conn.execute(cases.insert().values(slug=slug, title=title, payload=payload,
                                author=actor, created_at=utc_time())).inserted_primary_key[0]
         log(conn, actor, 'create_case', case_id)
         return found(conn, cases, case_id)
 
 
-def enqueue(case_id, actor):
-    with engine.begin() as conn:
-        found(conn, cases, case_id)
-        run_id = conn.execute(runs.insert().values(case_id=case_id, status=Status.QUEUED,
-                              owner=actor, created_at=utc_time())).inserted_primary_key[0]
-        log(conn, actor, 'enqueue', run_id)
-        result = found(conn, runs, run_id)
+def _wake():
     try:
         cache.lpush('worker:wake', 'queued')
         cache.ltrim('worker:wake', 0, 99)
     except Exception:
         # The durable database queue is polled even if Redis is temporarily unavailable.
         pass
+
+
+def enqueue(case_id, actor):
+    with engine.begin() as conn:
+        found(conn, cases, case_id)
+        # Pin the version that is published at this instant, so a correction
+        # published while the run waits in the queue does not change what it sees.
+        corrections.ensure_baseline(conn)
+        version = corrections.published_version(conn, lock=True)
+        run_id = conn.execute(runs.insert().values(
+            case_id=case_id, status=Status.QUEUED, owner=actor,
+            delegation_version_id=version['id'], created_at=utc_time(),
+        )).inserted_primary_key[0]
+        log(conn, actor, 'enqueue', run_id)
+        result = found(conn, runs, run_id)
+    _wake()
+    return result
+
+
+def retry(identity, actor):
+    """Re-run a failed verification against the very version it already pinned."""
+    with engine.begin() as conn:
+        previous = found(conn, runs, identity)
+        if previous['status'] != Status.FAILED:
+            raise HTTPException(409, '只有执行失败的验签可以重试')
+        replay = conn.execute(select(runs.c.id).where(runs.c.previous_run_id == identity)).first()
+        if replay:
+            # A retry already exists; returning it keeps the retry idempotent.
+            return found(conn, runs, replay.id)
+        if previous['delegation_version_id'] is None:
+            corrections.ensure_baseline(conn)
+            version = corrections.published_version(conn, lock=True)
+            version_id = version['id']
+        else:
+            version_id = previous['delegation_version_id']
+        try:
+            with conn.begin_nested():
+                run_id = conn.execute(runs.insert().values(
+                    case_id=previous['case_id'], status=Status.QUEUED, owner=actor,
+                    delegation_version_id=version_id, previous_run_id=identity, created_at=utc_time(),
+                )).inserted_primary_key[0]
+        except IntegrityError:
+            # Two retries raced; the unique previous_run_id keeps exactly one.
+            replay = conn.execute(select(runs.c.id).where(runs.c.previous_run_id == identity)).first()
+            if not replay:
+                raise
+            return found(conn, runs, replay.id)
+        log(conn, actor, 'retry', run_id)
+        result = found(conn, runs, run_id)
+    _wake()
     return result
 
 
@@ -66,17 +121,27 @@ def claim():
     ready = or_(runs.c.status == Status.QUEUED,
                 and_(runs.c.status == Status.RUNNING, runs.c.started_at < utc_time(-600)))
     with engine.begin() as conn:
-        run = conn.execute(select(runs.c.id, runs.c.case_id).where(ready).order_by(runs.c.id)
-                           .limit(1).with_for_update(skip_locked=True)).first()
+        run = conn.execute(select(runs.c.id, runs.c.case_id, runs.c.delegation_version_id).where(ready)
+                           .order_by(runs.c.id).limit(1).with_for_update(skip_locked=True)).first()
         if not run:
             return None
         token = str(uuid.uuid4())
         conn.execute(runs.update().where(runs.c.id == run.id).values(
             started_at=utc_time(), status=Status.RUNNING, attempt_token=token))
-        return run.id, token, found(conn, cases, run.case_id)['payload']
+        payload = found(conn, cases, run.case_id)['payload']
+        version = corrections.version_by_id(conn, run.delegation_version_id) if run.delegation_version_id else None
+        return run.id, token, payload, version
 
 
-def finish(run_id, token, result=None, error=None):
+def finish(run_id, token, result=None, error=None, version=None):
+    if result is not None and version:
+        result = {**result, 'delegation_version': {
+            'version_no': version['version_no'],
+            'digest': version['digest'],
+            'source': version['source'],
+            'source_ref': version['source_ref'],
+            'published_at': version['published_at'],
+        }}
     digest = hashlib.sha256(canonical(result)).hexdigest() if result is not None else None
     status = Status.FAILED if error else Status.COMPLETE
     with engine.begin() as conn:
@@ -86,7 +151,12 @@ def finish(run_id, token, result=None, error=None):
         if not count:
             return
         if result is not None:
-            conn.execute(evidence.insert().values(run_id=run_id, report=result, digest=digest))
+            conn.execute(evidence.insert().values(
+                run_id=run_id, report=result, digest=digest,
+                delegation_version_id=version['id'] if version else None,
+                delegation_version_no=version['version_no'] if version else None,
+                delegation_digest=version['digest'] if version else None,
+            ))
         log(conn, 'worker', status.value, run_id)
 
 
